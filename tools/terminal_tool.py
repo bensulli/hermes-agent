@@ -318,6 +318,7 @@ def _reset_cached_sudo_passwords() -> None:
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
+    check_terminal_policy as _check_terminal_policy_impl,
 )
 
 
@@ -325,6 +326,15 @@ def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback())
+
+
+def _check_terminal_policy(command: str, workdir: str | None = None) -> dict:
+    """Delegate terminal allow/block policy checks with the CLI approval callback."""
+    return _check_terminal_policy_impl(
+        command,
+        workdir=workdir,
+        approval_callback=_get_approval_callback(),
+    )
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -1855,6 +1865,17 @@ def terminal_tool(
                         _last_activity[effective_task_id] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+
+        # Pre-exec terminal policy wrapper (allow/block before shell execution)
+        if not force:
+            policy_result = _check_terminal_policy(command, workdir=workdir)
+            if not policy_result["approved"]:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": policy_result.get("message", "Blocked by terminal policy."),
+                    "status": policy_result.get("status", "blocked"),
+                }, ensure_ascii=False)
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)

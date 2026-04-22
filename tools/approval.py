@@ -12,10 +12,12 @@ import contextvars
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
 import unicodedata
+from pathlib import Path
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -308,6 +310,16 @@ def _sudo_stdin_block_result(description: str) -> dict:
         ),
     }
 
+
+_TERMINAL_POLICY_PREFIX = "terminal_policy:exe:"
+_TERMINAL_POLICY_ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+# Shell control tokens that must never appear unquoted when
+# deny_shell_features is enabled.  ``shlex`` with ``punctuation_chars``
+# splits these out as standalone tokens only when they appear outside
+# quotes, so this check correctly allows ``grep "foo|bar"`` while
+# rejecting ``ls | grep foo``.
+_TERMINAL_POLICY_CONTROL_CHARS = set("|&;<>()")
+_TERMINAL_POLICY_SUBSTITUTION_PREFIXES = ("$(", "`", "<(", ">(")
 
 # =========================================================================
 # Dangerous command patterns
@@ -663,15 +675,18 @@ def load_permanent(patterns: set):
 # =========================================================================
 
 def load_permanent_allowlist() -> set:
-    """Load permanently allowed command patterns from config.
-
-    Also syncs them into the approval module so is_approved() works for
-    patterns added via 'always' in a previous session.
-    """
+    """Load permanently allowed dangerous-command and terminal-policy approvals."""
     try:
         from hermes_cli.config import load_config
+
         config = load_config()
         patterns = set(config.get("command_allowlist", []) or [])
+        policy = _normalize_terminal_policy_config(config.get("terminal_policy", {}))
+        patterns.update(
+            _terminal_policy_key(_normalize_executable_name(command))
+            for command in policy.get("allow_commands", [])
+            if _normalize_executable_name(command)
+        )
         if patterns:
             load_permanent(patterns)
         return patterns
@@ -681,14 +696,455 @@ def load_permanent_allowlist() -> set:
 
 
 def save_permanent_allowlist(patterns: set):
-    """Save permanently allowed command patterns to config."""
+    """Save permanently allowed dangerous-command patterns to config."""
     try:
         from hermes_cli.config import load_config, save_config
         config = load_config()
-        config["command_allowlist"] = list(patterns)
+        config["command_allowlist"] = sorted(
+            pattern for pattern in patterns if not str(pattern).startswith(_TERMINAL_POLICY_PREFIX)
+        )
         save_config(config)
     except Exception as e:
         logger.warning("Could not save allowlist: %s", e)
+
+
+def _normalize_terminal_policy_config(config: dict | None) -> dict:
+    """Return a normalized terminal policy config block with safe defaults."""
+    config = config or {}
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "default": str(config.get("default", "deny")).lower().strip(),
+        "allow_commands": list(config.get("allow_commands", []) or []),
+        "block_commands": list(config.get("block_commands", []) or []),
+        "allow_rules": list(config.get("allow_rules", []) or []),
+        "allow_workdirs": list(config.get("allow_workdirs", []) or []),
+        "deny_shell_features": bool(config.get("deny_shell_features", True)),
+        "allow_env_assignments": bool(config.get("allow_env_assignments", False)),
+    }
+
+
+def _get_terminal_policy_config() -> dict:
+    """Read and normalize the terminal_policy config block."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        return _normalize_terminal_policy_config(config.get("terminal_policy", {}))
+    except Exception as e:
+        logger.warning("Failed to load terminal policy config: %s", e)
+        return _normalize_terminal_policy_config({})
+
+
+def _terminal_policy_key(executable: str) -> str:
+    return f"{_TERMINAL_POLICY_PREFIX}{executable}"
+
+
+def _terminal_policy_executable_from_key(key: str) -> str | None:
+    if not isinstance(key, str) or not key.startswith(_TERMINAL_POLICY_PREFIX):
+        return None
+    executable = key[len(_TERMINAL_POLICY_PREFIX):].strip().lower()
+    return executable or None
+
+
+def _normalize_executable_name(token: str) -> str:
+    return os.path.basename((token or "").strip()).lower()
+
+
+def _terminal_policy_paths_allow(workdir: str | None, allowed_roots: list[str]) -> bool:
+    if not workdir or not allowed_roots:
+        return True
+    try:
+        resolved_workdir = Path(workdir).expanduser().resolve(strict=False)
+    except Exception:
+        return False
+
+    for root in allowed_roots:
+        try:
+            resolved_root = Path(root).expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        if resolved_workdir == resolved_root or resolved_root in resolved_workdir.parents:
+            return True
+    return False
+
+
+def _parse_terminal_policy_command(command: str, policy: dict) -> dict:
+    """Parse command for terminal policy enforcement.
+
+    Uses ``shlex`` with ``punctuation_chars`` so quoted metacharacters are
+    preserved as part of a single token and only *unquoted* shell control
+    tokens trigger the metachar rejection.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return {"ok": False, "reason": "Command is empty."}
+
+    normalized = _normalize_command_for_detection(command)
+
+    lexer = shlex.shlex(normalized, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError as exc:
+        return {"ok": False, "reason": f"Command could not be parsed safely: {exc}"}
+
+    if not tokens:
+        return {"ok": False, "reason": "Command is empty."}
+
+    deny_shell_features = policy.get("deny_shell_features", True)
+
+    if deny_shell_features:
+        for token in tokens:
+            # Standalone punctuation tokens produced by shlex
+            # (|, ||, &, &&, ;, ;;, (, ), <, >, <<, >>) are shell control
+            # operators only when *unquoted* — quoted strings are merged into
+            # a normal token by shlex, so they slip past this check safely.
+            if token and all(ch in _TERMINAL_POLICY_CONTROL_CHARS for ch in token):
+                return {
+                    "ok": False,
+                    "reason": "Command uses shell metacharacters, which terminal policy blocks.",
+                }
+            if any(token.startswith(prefix) for prefix in _TERMINAL_POLICY_SUBSTITUTION_PREFIXES):
+                return {
+                    "ok": False,
+                    "reason": "Command uses shell command/process substitution, which terminal policy blocks.",
+                }
+            if "`" in token:
+                return {
+                    "ok": False,
+                    "reason": "Command uses backtick substitution, which terminal policy blocks.",
+                }
+
+    # Drop control tokens so they don't leak into executable/arg parsing.
+    argv = [
+        token for token in tokens
+        if not (token and all(ch in _TERMINAL_POLICY_CONTROL_CHARS for ch in token))
+    ]
+    if not argv:
+        return {"ok": False, "reason": "Command is empty."}
+
+    idx = 0
+    while idx < len(argv) and _TERMINAL_POLICY_ENV_ASSIGNMENT_RE.match(argv[idx]):
+        if not policy.get("allow_env_assignments", False):
+            return {
+                "ok": False,
+                "reason": "Command uses inline environment assignments, which terminal policy blocks.",
+            }
+        idx += 1
+
+    if idx >= len(argv):
+        return {"ok": False, "reason": "Command is missing an executable."}
+
+    executable = _normalize_executable_name(argv[idx])
+    if not executable:
+        return {"ok": False, "reason": "Command is missing an executable."}
+
+    return {
+        "ok": True,
+        "argv": argv,
+        "executable": executable,
+        "args": argv[idx + 1 :],
+        "args_str": " ".join(argv[idx + 1 :]),
+    }
+
+
+def _terminal_policy_matches_allow_rule(executable: str, args_str: str, allow_rules: list[dict]) -> bool:
+    for rule in allow_rules:
+        if not isinstance(rule, dict):
+            continue
+        rule_executable = _normalize_executable_name(str(rule.get("exe", "")))
+        if not rule_executable or rule_executable != executable:
+            continue
+        args_regex = rule.get("args_regex")
+        if not args_regex:
+            return True
+        try:
+            if re.match(str(args_regex), args_str):
+                return True
+        except re.error:
+            logger.warning("Ignoring invalid terminal_policy args_regex for %s", rule_executable)
+    return False
+
+
+_TERMINAL_POLICY_SUBCOMMAND_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*$")
+
+
+def _build_terminal_policy_narrow_rule(executable: str, args: list[str]) -> dict:
+    """Build a narrow allow_rules entry for an approved command.
+
+    - ``git status`` → ``{exe: git, args_regex: "^status(\\s|$)"}``
+    - ``rg``          → ``{exe: rg}`` (no args — match any invocation)
+    - ``python -V``   → ``{exe: python}`` (first arg is a flag, broaden safely)
+    """
+    first = args[0] if args else ""
+    if first and _TERMINAL_POLICY_SUBCOMMAND_RE.match(first):
+        return {
+            "exe": executable,
+            "args_regex": rf"^{re.escape(first)}(\s|$)",
+        }
+    return {"exe": executable}
+
+
+def _merge_terminal_policy_rule(existing_rules: list, new_rule: dict) -> list:
+    """Merge a new allow_rule into the existing list, de-duplicating."""
+    merged = [r for r in existing_rules if isinstance(r, dict)]
+    for rule in merged:
+        if rule.get("exe") == new_rule.get("exe") and rule.get("args_regex") == new_rule.get("args_regex"):
+            return merged
+    merged.append(new_rule)
+    return merged
+
+
+def _save_terminal_policy_allow_rule(executable: str, args: list[str]) -> dict:
+    """Persist a narrow allow_rules entry for ``executable`` and return it."""
+    new_rule = _build_terminal_policy_narrow_rule(executable, args)
+    try:
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        policy = _normalize_terminal_policy_config(config.get("terminal_policy", {}))
+        policy["allow_rules"] = _merge_terminal_policy_rule(
+            policy.get("allow_rules", []), new_rule
+        )
+        config["terminal_policy"] = policy
+        save_config(config)
+    except Exception as e:
+        logger.warning("Could not save terminal policy allow_rule: %s", e)
+    return new_rule
+
+
+def _save_terminal_policy_allowlist(permanent_approvals: set) -> None:
+    """Persist permanent terminal-policy approvals as exe-only fallback.
+
+    Kept for compatibility with the old ``allow_commands`` flow; new
+    ``always`` approvals go through :func:`_save_terminal_policy_allow_rule`.
+    """
+    try:
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        policy = _normalize_terminal_policy_config(config.get("terminal_policy", {}))
+        persisted_commands = sorted(
+            executable
+            for key in permanent_approvals
+            for executable in [_terminal_policy_executable_from_key(key)]
+            if executable
+        )
+        policy["allow_commands"] = persisted_commands
+        config["terminal_policy"] = policy
+        save_config(config)
+    except Exception as e:
+        logger.warning("Could not save terminal policy allowlist: %s", e)
+
+
+def _persist_terminal_policy_choice(session_key: str, policy_key: str, choice: str,
+                                    executable: str, args: list[str]) -> None:
+    if choice in {"session", "always"}:
+        approve_session(session_key, policy_key)
+    if choice == "always":
+        approve_permanent(policy_key)
+        _save_terminal_policy_allow_rule(executable, args)
+
+
+def check_terminal_policy(command: str, workdir: str | None = None,
+                          approval_callback=None) -> dict:
+    """Enforce terminal allow/block rules before dangerous-command scanning."""
+    policy = _get_terminal_policy_config()
+    if not policy.get("enabled"):
+        return {"approved": True, "message": None}
+
+    parsed = _parse_terminal_policy_command(command, policy)
+    if not parsed["ok"]:
+        return {
+            "approved": False,
+            "status": "blocked",
+            "message": f"Blocked by terminal policy: {parsed['reason']}",
+        }
+
+    executable = parsed["executable"]
+    policy_key = _terminal_policy_key(executable)
+    session_key = get_current_session_key()
+
+    if executable in {_normalize_executable_name(cmd) for cmd in policy.get("block_commands", [])}:
+        return {
+            "approved": False,
+            "status": "blocked",
+            "message": f"Blocked by terminal policy: '{executable}' is blocklisted.",
+            "description": f"'{executable}' is blocklisted",
+        }
+
+    if not _terminal_policy_paths_allow(workdir, policy.get("allow_workdirs", [])):
+        return {
+            "approved": False,
+            "status": "blocked",
+            "message": (
+                f"Blocked by terminal policy: workdir '{workdir}' is not inside an approved root."
+            ),
+            "description": f"workdir '{workdir}' is not approved",
+        }
+
+    allow_commands = {_normalize_executable_name(cmd) for cmd in policy.get("allow_commands", [])}
+    allowed = (
+        executable in allow_commands
+        or is_approved(session_key, policy_key)
+        or _terminal_policy_matches_allow_rule(
+            executable,
+            parsed["args_str"],
+            policy.get("allow_rules", []),
+        )
+    )
+    if allowed:
+        return {"approved": True, "message": None}
+
+    default_mode = policy.get("default", "deny")
+    if default_mode == "allow":
+        return {"approved": True, "message": None}
+
+    description = f"Executable '{executable}' is not in terminal policy allowlist"
+    is_cli = os.getenv("HERMES_INTERACTIVE")
+    is_gateway = os.getenv("HERMES_GATEWAY_SESSION")
+    is_ask = os.getenv("HERMES_EXEC_ASK")
+
+    if default_mode != "ask":
+        return {
+            "approved": False,
+            "status": "blocked",
+            "message": f"Blocked by terminal policy: {description}.",
+            "description": description,
+        }
+
+    if not is_cli and not is_gateway and not is_ask:
+        return {
+            "approved": False,
+            "status": "blocked",
+            "message": (
+                f"Blocked by terminal policy: {description}. No user is present to approve it."
+            ),
+            "description": description,
+        }
+
+    if is_gateway or is_ask:
+        notify_cb = None
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+
+        if notify_cb is not None:
+            approval_data = {
+                "command": command,
+                "pattern_key": policy_key,
+                "pattern_keys": [policy_key],
+                "description": description,
+            }
+            entry = _ApprovalEntry(approval_data)
+            with _lock:
+                _gateway_queues.setdefault(session_key, []).append(entry)
+
+            try:
+                notify_cb(approval_data)
+            except Exception as exc:
+                logger.warning("Gateway approval notify failed: %s", exc)
+                with _lock:
+                    queue = _gateway_queues.get(session_key, [])
+                    if entry in queue:
+                        queue.remove(entry)
+                    if not queue:
+                        _gateway_queues.pop(session_key, None)
+                return {
+                    "approved": False,
+                    "status": "blocked",
+                    "message": "Blocked by terminal policy: failed to send approval request.",
+                    "description": description,
+                }
+
+            timeout = _get_approval_config().get("gateway_timeout", 300)
+            try:
+                timeout = int(timeout)
+            except (ValueError, TypeError):
+                timeout = 300
+
+            try:
+                from tools.environments.base import touch_activity_if_due
+            except Exception:  # pragma: no cover
+                touch_activity_if_due = None
+
+            _now = time.monotonic()
+            _deadline = _now + max(timeout, 0)
+            _activity_state = {"last_touch": _now, "start": _now}
+            resolved = False
+            while True:
+                _remaining = _deadline - time.monotonic()
+                if _remaining <= 0:
+                    break
+                if entry.event.wait(timeout=min(1.0, _remaining)):
+                    resolved = True
+                    break
+                if touch_activity_if_due is not None:
+                    touch_activity_if_due(_activity_state, "waiting for terminal policy approval")
+
+            with _lock:
+                queue = _gateway_queues.get(session_key, [])
+                if entry in queue:
+                    queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+
+            choice = entry.result
+            if not resolved or choice is None or choice == "deny":
+                reason = "timed out" if not resolved else "was denied by user"
+                return {
+                    "approved": False,
+                    "status": "blocked",
+                    "message": f"Blocked by terminal policy: {description}; approval {reason}.",
+                    "description": description,
+                }
+
+            _persist_terminal_policy_choice(
+                session_key, policy_key, choice, executable, parsed["args"]
+            )
+            return {
+                "approved": True,
+                "message": None,
+                "user_approved": True,
+                "description": description,
+            }
+
+        submit_pending(session_key, {
+            "command": command,
+            "pattern_key": policy_key,
+            "pattern_keys": [policy_key],
+            "description": description,
+        })
+        return {
+            "approved": False,
+            "pattern_key": policy_key,
+            "status": "approval_required",
+            "command": command,
+            "description": description,
+            "message": f"⚠️ {description}. Asking the user for approval.\n\n**Command:**\n```\n{command}\n```",
+        }
+
+    choice = prompt_dangerous_approval(
+        command,
+        description,
+        allow_permanent=True,
+        approval_callback=approval_callback,
+    )
+    if choice == "deny":
+        return {
+            "approved": False,
+            "status": "blocked",
+            "message": f"Blocked by terminal policy: {description}; user denied approval.",
+            "description": description,
+        }
+
+    _persist_terminal_policy_choice(
+        session_key, policy_key, choice, executable, parsed["args"]
+    )
+    return {
+        "approved": True,
+        "message": None,
+        "user_approved": True,
+        "description": description,
+    }
 
 
 # =========================================================================

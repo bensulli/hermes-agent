@@ -1447,6 +1447,24 @@ DEFAULT_CONFIG = {
 
     # Permanently allowed dangerous command patterns (added via "always" approval)
     "command_allowlist": [],
+
+    # Terminal policy wrapper for the terminal tool.
+    # enabled: enforce allow/block decisions before shell execution.
+    # default:
+    #   deny  — block commands whose executable is not allowlisted
+    #   ask   — request approval for new executables, with session/permanent options
+    #   allow — allow unknown executables unless blocklisted
+    "terminal_policy": {
+        "enabled": False,
+        "default": "deny",
+        "allow_commands": [],
+        "block_commands": [],
+        "allow_rules": [],
+        "allow_workdirs": [],
+        "deny_shell_features": True,
+        "allow_env_assignments": False,
+    },
+
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
 
