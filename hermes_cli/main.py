@@ -10299,133 +10299,6 @@ def cmd_dashboard(args):
         remaining = _find_stale_dashboard_pids()
         sys.exit(1 if remaining else 0)
 
-    # ------------------------------------------------------------------
-    # Determine background vs foreground mode.
-    # Priority: --foreground/--fg flag > --background flag > config >
-    # HERMES_DASHBOARD_FG env var (set on the re-spawned child).
-    # Default: background=True (from config).
-    # ------------------------------------------------------------------
-    # If we're the re-spawned child, force foreground — no re-forking.
-    if os.environ.get("HERMES_DASHBOARD_FG") == "1":
-        run_in_background = False
-    elif getattr(args, "foreground", False):
-        run_in_background = False
-    elif getattr(args, "background", False):
-        run_in_background = True
-    else:
-        # Fall back to config setting.
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
-        run_in_background = cfg.get("dashboard", {}).get("background", True)
-
-    # ------------------------------------------------------------------
-    # Background mode: spawn a detached child with HERMES_DASHBOARD_FG=1
-    # so the child runs the actual server in the foreground while the
-    # parent exits immediately.
-    # ------------------------------------------------------------------
-    if run_in_background:
-        # Rebuild the argv for the child: same command, but force
-        # foreground mode and suppress browser opening on the detached
-        # child (the parent already opened it if appropriate).
-        child_argv = [sys.executable, "-m", "hermes_cli.main", "dashboard"]
-        child_argv.extend(["--host", str(args.host)])
-        child_argv.extend(["--port", str(args.port)])
-        if getattr(args, "tui", False) or os.environ.get("HERMES_DASHBOARD_TUI") == "1":
-            child_argv.append("--tui")
-        if getattr(args, "insecure", False):
-            child_argv.append("--insecure")
-        # The child is the real server — HERMES_DASHBOARD_FG=1 prevents
-        # it from re-backgrounding.
-        child_env = os.environ.copy()
-        child_env["HERMES_DASHBOARD_FG"] = "1"
-        # Suppress browser opening in the detached child — we open
-        # the browser from the parent before it exits.
-        child_env["HERMES_DASHBOARD_NO_OPEN"] = "1"
-        # Preserve HERMES_WEB_DIST if set (avoids rebuild in child).
-        if "HERMES_WEB_DIST" in os.environ:
-            child_env["HERMES_WEB_DIST"] = os.environ["HERMES_WEB_DIST"]
-
-        if sys.platform == "win32":
-            # Windows: use subprocess.Popen with detached process flags.
-            import subprocess
-
-            creationflags = (
-                subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-                | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-            )
-            try:
-                subprocess.Popen(
-                    child_argv,
-                    env=child_env,
-                    creationflags=creationflags,
-                    close_fds=True,
-                )
-            except OSError as e:
-                print(f"Could not start dashboard in background: {e}")
-                print("Falling back to foreground mode.")
-                run_in_background = False
-            else:
-                url = f"http://{args.host}:{args.port}"
-                print(f"  Dashboard running in background → {url}")
-                print(f"  Stop with: hermes dashboard --stop")
-                print(f"  Check status with: hermes dashboard --status")
-                if not args.no_open:
-                    import webbrowser
-
-                    webbrowser.open(url)
-                sys.exit(0)
-        else:
-            # Unix: double-fork to fully detach from terminal.
-            try:
-                pid = os.fork()
-            except OSError as e:
-                print(f"Could not fork dashboard into background: {e}")
-                print("Falling back to foreground mode.")
-                run_in_background = False
-            else:
-                if pid > 0:
-                    # Parent: print info and exit immediately.
-                    url = f"http://{args.host}:{args.port}"
-                    print(f"  Dashboard running in background → {url}")
-                    print(f"  Stop with: hermes dashboard --stop")
-                    print(f"  Check status with: hermes dashboard --status")
-                    if not args.no_open:
-                        import webbrowser
-
-                        webbrowser.open(url)
-                    sys.exit(0)
-                else:
-                    # First child: decouple from parent's session.
-                    os.setsid()
-                    try:
-                        second_pid = os.fork()
-                    except OSError:
-                        # Can't second-fork — just continue in first child.
-                        second_pid = 0
-                    if second_pid > 0:
-                        # First child exits immediately.
-                        os._exit(0)
-                    # Second child (or first child if second fork failed):
-                    # this is the long-lived server process.
-                    os.close(0)
-                    os.close(1)
-                    os.close(2)
-                    # Redirect stdin/stdout/stderr to /dev/null so uvicorn
-                    # doesn't try to write to a closed terminal.
-                    devnull = os.open(os.devnull, os.O_RDWR)
-                    os.dup2(devnull, 0)
-                    os.dup2(devnull, 1)
-                    os.dup2(devnull, 2)
-                    os.close(devnull)
-                    # Exec the child — replaces the process entirely.
-                    os.execvpe(child_argv[0], child_argv, child_env)
-                    # execvpe never returns; if it does, something is very wrong.
-                    os._exit(1)
-
-    # ------------------------------------------------------------------
-    # Foreground mode: the original behaviour.
-    # ------------------------------------------------------------------
     try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
@@ -10462,14 +10335,10 @@ def cmd_dashboard(args):
     from hermes_cli.web_server import start_server
 
     embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
-    # When running as a background child, suppress browser opening
-    # (the parent already handled it).
-    suppress_open = os.environ.get("HERMES_DASHBOARD_NO_OPEN") == "1"
-    open_browser = not args.no_open and not suppress_open
     start_server(
         host=args.host,
         port=args.port,
-        open_browser=open_browser,
+        open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
         embedded_chat=embedded_chat,
     )
@@ -13268,8 +13137,8 @@ Examples:
     # =========================================================================
     dashboard_parser = subparsers.add_parser(
         "dashboard",
-        help="Start the web UI dashboard (runs in background by default)",
-        description="Launch the Hermes Agent web dashboard for managing config, API keys, and sessions. Runs in the background by default (configurable via dashboard.background). Use --foreground to run in the foreground.",
+        help="Start the web UI dashboard",
+        description="Launch the Hermes Agent web dashboard for managing config, API keys, and sessions",
     )
     dashboard_parser.add_argument(
         "--port", type=int, default=9119, help="Port (default 9119)"
@@ -13294,7 +13163,6 @@ Examples:
         ),
     )
     dashboard_parser.add_argument(
-<<<<<<< Updated upstream
         "--skip-build",
         action="store_true",
         help=(
@@ -13302,20 +13170,6 @@ Examples:
             "Useful for non-interactive contexts (Windows Scheduled Tasks, CI) "
             "where npm may not be available. Pre-build with: cd web && npm run build"
         ),
-=======
-        "--foreground", "--fg",
-        action="store_true",
-        default=False,
-        dest="foreground",
-        help="Run dashboard in foreground (overrides config dashboard.background=true)",
-    )
-    dashboard_parser.add_argument(
-        "--background",
-        action="store_true",
-        default=False,
-        dest="background",
-        help="Run dashboard in background (explicit, same as the default behavior)",
->>>>>>> Stashed changes
     )
     # Lifecycle flags — mutually exclusive with each other and with the
     # start-a-server flags above (if both are passed, --stop / --status win
