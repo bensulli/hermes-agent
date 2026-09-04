@@ -1975,6 +1975,58 @@ class MatrixAdapter(BasePlatformAdapter):
         self._background_read_receipt(room_id, event_id)
         return body, is_dm, chat_type, thread_id, display_name, source
 
+    async def _fetch_reply_text(self, room_id: str, event_id: str) -> Optional[str]:
+        """Fetch the plaintext body of a replied-to Matrix event.
+
+        Returns None on any failure (fetch error, timeout, encrypted event
+        without crypto, non-text event). Never raises - a reply-text lookup
+        must not stall or break incoming message processing.
+        """
+        if not self._client or not room_id or not event_id:
+            return None
+
+        try:
+            evt = await asyncio.wait_for(
+                self._client.get_event(RoomID(room_id), EventID(event_id)),
+                timeout=5.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Matrix: failed to fetch reply-to event %s: %s", event_id, exc
+            )
+            return None
+
+        # Encrypted events carry no readable body until decrypted client-side.
+        if str(getattr(evt, "type", "")) == "m.room.encrypted":
+            crypto = getattr(self._client, "crypto", None)
+            decrypt = getattr(crypto, "decrypt_megolm_event", None)
+            if decrypt is None:
+                return None
+            try:
+                evt = decrypt(evt)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Matrix: failed to decrypt reply-to event %s: %s", event_id, exc
+                )
+                return None
+
+        content = getattr(evt, "content", None)
+        if content is None:
+            return None
+        if isinstance(content, dict):
+            if content.get("msgtype") != "m.text":
+                return None
+            text = content.get("body")
+        else:
+            # msgtype is a mautrix MessageType enum (not a str subclass), so
+            # compare via str() - `MessageType.TEXT != "m.text"` is always True.
+            if str(getattr(content, "msgtype", None)) != "m.text":
+                return None
+            text = getattr(content, "body", None)
+        if not text:
+            return None
+        return str(text).strip() or None
+
     async def _extract_reply_context(
         self, room_id: str, body: str, relates_to: dict
     ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -1989,6 +2041,13 @@ class MatrixAdapter(BasePlatformAdapter):
             # Resolve the replied-to author's display name (falls back to localpart).
             if reply_to_author_id:
                 reply_to_author_name = await self._get_display_name(room_id, reply_to_author_id)
+        # Authoritative fetch of the replied-to event body wins over the inline
+        # quote fallback, which clients may truncate or mangle (and media
+        # replies carry no quote at all, so the fallback is empty for them).
+        if reply_to:
+            fetched = await self._fetch_reply_text(room_id, reply_to)
+            if fetched:
+                reply_to_text = fetched
         return body, reply_to, reply_to_text, reply_to_author_id, reply_to_author_name
 
     async def _build_inbound_event(

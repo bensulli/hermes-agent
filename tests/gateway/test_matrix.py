@@ -3342,3 +3342,187 @@ class TestCryptoPickleKeyMigration:
         # start still sees a legacy-key account and retries the migration.
         store.put_account.assert_not_awaited()
         assert "retried on the next start" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Reply-to text fetching
+# ---------------------------------------------------------------------------
+
+class TestMatrixReplyText:
+    """Authoritative get_event fetch of replied-to text, with quote fallback."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._client = MagicMock()
+        self.adapter._client.download_media = AsyncMock(return_value=None)
+        self.adapter._is_dm_room = AsyncMock(return_value=True)
+        self.adapter._get_display_name = AsyncMock(return_value="Alice")
+        self.adapter._background_read_receipt = MagicMock()
+        self.adapter._require_mention = True
+        self.adapter._free_rooms = set()
+        # Disable text batching so handle_message fires synchronously.
+        self.adapter._text_batch_delay_seconds = 0
+
+    async def _run_text_reply(self, body, relates_to, fetched_text):
+        """Dispatch a reply through _handle_text_message with _fetch_reply_text
+        mocked to return ``fetched_text`` (None simulates a fetch failure)."""
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter.handle_message = capture
+        self.adapter._fetch_reply_text = AsyncMock(return_value=fetched_text)
+
+        await self.adapter._handle_text_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$reply1",
+            event_ts=0.0,
+            source_content={"msgtype": "m.text", "body": body},
+            relates_to=relates_to,
+        )
+        return captured_event
+
+    @pytest.mark.asyncio
+    async def test_reply_fetch_wins_over_quote(self):
+        evt = await self._run_text_reply(
+            body="> truncated quote\n\nmy reply",
+            relates_to={"m.in_reply_to": {"event_id": "$orig"}},
+            fetched_text="full authoritative text",
+        )
+        assert evt is not None
+        assert evt.reply_to_message_id == "$orig"
+        assert evt.reply_to_text == "full authoritative text"
+        # The quoted fallback is stripped from the visible body.
+        assert evt.text == "my reply"
+
+    @pytest.mark.asyncio
+    async def test_reply_falls_back_to_quote_when_fetch_fails(self):
+        evt = await self._run_text_reply(
+            body="> quoted fallback\n\nmy reply",
+            relates_to={"m.in_reply_to": {"event_id": "$orig"}},
+            fetched_text=None,
+        )
+        assert evt is not None
+        assert evt.reply_to_message_id == "$orig"
+        assert evt.reply_to_text == "quoted fallback"
+        assert evt.text == "my reply"
+
+    @pytest.mark.asyncio
+    async def test_non_reply_has_no_reply_text(self):
+        evt = await self._run_text_reply(
+            body="hello there",
+            relates_to={},
+            fetched_text=None,
+        )
+        assert evt is not None
+        assert evt.reply_to_message_id is None
+        assert evt.reply_to_text is None
+        assert evt.text == "hello there"
+
+    @pytest.mark.asyncio
+    async def test_media_reply_sets_reply_text(self):
+        self.adapter._fetch_reply_text = AsyncMock(
+            return_value="what do you think of this?"
+        )
+        self.adapter._mxc_to_http = lambda url: "https://example.org/x.png"
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter.handle_message = capture
+        await self.adapter._handle_media_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$img1",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.image",
+                "body": "photo.png",
+                "url": "mxc://example/photo.png",
+                "info": {"mimetype": "image/png"},
+            },
+            relates_to={"m.in_reply_to": {"event_id": "$orig"}},
+            msgtype="m.image",
+        )
+        assert captured_event is not None
+        assert captured_event.reply_to_message_id == "$orig"
+        assert captured_event.reply_to_text == "what do you think of this?"
+
+    # --- Direct unit tests for _fetch_reply_text ---
+
+    def _simple_client(self, fetched_event, crypto=None):
+        return types.SimpleNamespace(
+            get_event=AsyncMock(return_value=fetched_event),
+            crypto=crypto,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reply_to_non_text_event_returns_none(self):
+        fetched = types.SimpleNamespace(
+            type="m.room.message",
+            content=types.SimpleNamespace(msgtype="m.image", body="photo.png"),
+        )
+        self.adapter._client = self._simple_client(fetched)
+        text = await self.adapter._fetch_reply_text("!room:example.org", "$orig")
+        assert text is None
+
+    @pytest.mark.asyncio
+    async def test_fetch_with_enum_msgtype_returns_text(self):
+        """Regression: real mautrix returns msgtype as a MessageType enum.
+
+        ``MessageType.TEXT == "m.text"`` is False (it's not a str subclass),
+        so a direct comparison silently drops every real reply. The fetch
+        must compare via str().
+        """
+        import enum
+
+        class MsgType(enum.Enum):
+            TEXT = "m.text"
+
+            def __str__(self):
+                return self.value
+
+        fetched = types.SimpleNamespace(
+            type="m.room.message",
+            content=types.SimpleNamespace(msgtype=MsgType.TEXT, body="enum body"),
+        )
+        self.adapter._client = self._simple_client(fetched)
+        text = await self.adapter._fetch_reply_text("!room:example.org", "$orig")
+        assert text == "enum body"
+
+    @pytest.mark.asyncio
+    async def test_encrypted_event_without_crypto_returns_none(self):
+        encrypted = types.SimpleNamespace(
+            type="m.room.encrypted",
+            content=types.SimpleNamespace(algorithm="m.megolm.v1.aes-sha2"),
+        )
+        self.adapter._client = self._simple_client(encrypted)
+        text = await self.adapter._fetch_reply_text("!room:example.org", "$orig")
+        assert text is None
+
+    @pytest.mark.asyncio
+    async def test_encrypted_event_decrypts_to_text(self):
+        encrypted = types.SimpleNamespace(type="m.room.encrypted")
+        decrypted = types.SimpleNamespace(
+            type="m.room.message",
+            content=types.SimpleNamespace(msgtype="m.text", body="decrypted text"),
+        )
+        client = types.SimpleNamespace(
+            get_event=AsyncMock(return_value=encrypted),
+            crypto=types.SimpleNamespace(decrypt_megolm_event=lambda evt: decrypted),
+        )
+        self.adapter._client = client
+        text = await self.adapter._fetch_reply_text("!room:example.org", "$orig")
+        assert text == "decrypted text"
+
+    @pytest.mark.asyncio
+    async def test_fetch_returns_none_on_get_event_error(self):
+        client = types.SimpleNamespace(get_event=AsyncMock(side_effect=Exception("boom")))
+        self.adapter._client = client
+        text = await self.adapter._fetch_reply_text("!room:example.org", "$orig")
+        assert text is None
